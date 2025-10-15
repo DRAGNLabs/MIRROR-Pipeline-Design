@@ -1,4 +1,15 @@
-# %%
+"""
+This script is able to run a simple training run using Lightning Fabric FSDP.
+It is tested running on multiple machines with multiple gpus.
+
+How to use:
+- you'll need a pre-tokenized dataset, using the Llama tokenizer (which you can see
+how to set up below) in parquet format. I used the scripts from Rocket to do this.
+Once you have that, change the value for `tokenized_dataset_path` to wherever you saved that.
+- See `launch_experiment.sh` for how to run with sbatch. You can also import this into
+a notebook to run if you'd like.
+
+"""
 import dask.dataframe as dd
 from jsonargparse import lazy_instance
 import lightning as L
@@ -19,7 +30,10 @@ from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 
-# %%
+"""
+A very simple Llama test module. `hidden_size` is configurable as a way to change the size
+of model being tested. Parameters grow quadratically with `hidden_size`.
+"""
 class LightningLlama(L.LightningModule):
     def __init__(self, hidden_size: int = 768):
         super().__init__()
@@ -43,13 +57,16 @@ class LightningLlama(L.LightningModule):
         return optimizer
 
 
-# %%
 from torch.utils.data import get_worker_info
 from torch.distributed import get_rank, get_world_size
 
 tokenized_dataset_path = Path("/home/kobyjl/nobackup/autodelete/rocket-demo/tokenized/")
 
-
+"""
+This class is basically just ripped straight out of rocket. I think there may be ways built
+into Lightning or PyTorch to do this without dealing with the parallelism ourselves, but
+I haven't looked into that yet.
+"""
 class DataSet(torch.utils.data.IterableDataset):
     def __init__(
         self, path_to_data, pad_tok, bos_tok, eos_tok, max_sequence_embeddings, cap_length
@@ -118,14 +135,15 @@ class DataSet(torch.utils.data.IterableDataset):
 
 
 
-# %%
 tokenizer = AutoTokenizer.from_pretrained(
     '/home/kobyjl/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08/'
 )
-tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>")
+tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>") # for some reason the hub tokenizer doesn't have the pad token set
 
 
-# %%
+"""
+This is also largely just ripped from Rocket. Note that I capped the dataset length at 10k examples.
+"""
 class DataModule(L.LightningDataModule):
     def __init__(self, batch_size):
         super().__init__()
@@ -163,10 +181,13 @@ class DataModule(L.LightningDataModule):
         return self._dataloader(self.test_dataset)
 
 
-# %%
 from lightning.pytorch import Trainer
 from lightning.pytorch.plugins.environments import SLURMEnvironment # pyright: ignore
 
+"""
+The wrapper here was necessary so that we can access the timer after we're done and print out the total time
+elapsed. See LightningCLI below.
+"""
 timer = None
 class TimerWrapper(Timer):
     def __init__(self) -> None:
@@ -174,8 +195,6 @@ class TimerWrapper(Timer):
         global timer
         timer = self
 
-
-# %%
 def is_notebook():
     try:
         get_ipython() # pyright: ignore
@@ -184,41 +203,55 @@ def is_notebook():
         return False
 
 
-# %%
+# I'm not totally sure if this is the best setting for auto_wrap_policy. May be more efficient configurations.
 auto_wrap_policy = { Embedding, LlamaDecoderLayer, Linear }
 trainer_defaults = {
     'max_epochs': 1,
     'accelerator': 'gpu',
+    """
+    The FSDPStrategy signals that we may be running on multiple gpus/nodes.
+
+    We're supporting two different environments here: from the CLI and in a notebook. From the CLI, LightningCLI
+    will construct the classes involved, so we give it a `lazy_instance`. In a notebook, we can just give it the
+    strategy directly.
+    """
     'strategy': FSDPStrategy(auto_wrap_policy=auto_wrap_policy)
                 if is_notebook()
                 else lazy_instance(FSDPStrategy, auto_wrap_policy=auto_wrap_policy),
+    """
+    The Timer callback will track how long the training has run for (including across invocations if our training got
+    preempted)
+    """
     'callbacks': [TimerWrapper()],
 }
 
 
 # %%
 if is_notebook():
-    module = LightningLlama(8192)
-    dm = DataModule(1)
+    module = LightningLlama(hidden_size=8192)
+    dm = DataModule(batch_size=1)
     dm.setup('')
 
     trainer = Trainer(**trainer_defaults)
     trainer.fit(module, dm)
 else:
-    if len(sys.argv) > 1 and sys.argv[1] == '--print-size':
-        m = re.search(r'--model\.hidden_size=(\d+)', sys.argv[2])
-        if not m:
-            print('missing --model.hidden_size=')
-            exit()
-        module = LightningLlama(int(m.group(1)))
-        torchinfo.summary(module.model)
-        exit()
-    
     trainer_defaults = {
         **trainer_defaults,
+        """
+        The SLURMEnvironment plugin sets up requeueing after timeouts. In other words, if your training runs out of time, this line means
+        it will automatically requeue (if your sbatch file includes the proper settings for requeueing, which launch_experiment.sh does).
+        We are using `class_path` and `init_args` here because we want LightningCLI to construct it.
+        """
         'plugins': { 'class_path': 'lightning.pytorch.plugins.environments.SLURMEnvironment', 'init_args': { 'requeue_signal': signal.SIGHUP }}
 
     }
+    """
+    LightningCLI is a very cool class. It will automatically initialize our module and data module for us (given CLI arguments for the constructor args).
+    It can also do all kinds of other stuff like choosing which module to use if we have multiple. However, if you want something simpler, you can
+    construct the trainer manually, similarly to how it is done in the `is_notebook()` branch.
+
+    `save_config_kwargs` is necessary if your process gets requeued.
+    """
     LightningCLI(LightningLlama, DataModule, trainer_defaults=trainer_defaults, save_config_kwargs={ 'overwrite': True })
 if not timer:
     raise Exception('timer not set')
