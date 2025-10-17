@@ -1,40 +1,43 @@
+# %%
 """
 This script is able to run a simple training run using Lightning Fabric FSDP.
 It is tested running on multiple machines with multiple gpus.
 
 How to use:
 - you'll need a pre-tokenized dataset, using the Llama tokenizer (which you can see
-how to set up below) in parquet format. I used the scripts from Rocket to do this.
+how to set up below) in parquet format with a text column of lists of tokens. I used
+the scripts from Rocket to do this, using the huggingface wikitext dataset.
 Once you have that, change the value for `tokenized_dataset_path` to wherever you saved that.
-- See `launch_experiment.sh` for how to run with sbatch. You can also import this into
+- you'll need to download the llama tokenizer. You can use the `hf` cli to do that.
+Once downloaded, update the path used to construct the tokenizer below
+- See `launch_experiment.sh` for how to run with sbatch. You can also use this in
 a notebook to run if you'd like.
-
 """
-import dask.dataframe as dd
-from jsonargparse import lazy_instance
-import lightning as L
-from lightning.pytorch.callbacks import Timer
-from lightning.pytorch.cli import LightningCLI
-from lightning.pytorch.strategies import FSDPStrategy
-from pathlib import Path
-import os
-import re
 import signal
 import sys
+import time
+from types import FrameType
+from typing import Callable, List, Literal
+import dask.dataframe as dd
+from jsonargparse import auto_parser
+from pathlib import Path
+import os
+from lightning.fabric.plugins.environments.slurm import SLURMEnvironment
 import torch
 from torch import optim
 from torch.nn import Embedding, Linear
-from torch.utils.data import DataLoader
-import torchinfo
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 
+# %%
 """
 A very simple Llama test module. `hidden_size` is configurable as a way to change the size
-of model being tested. Parameters grow quadratically with `hidden_size`.
+of model being tested. Parameters grow quadratically with `hidden_size`. Minimum is 32, which
+runs fine of the P100s for quick testing.
 """
-class LightningLlama(L.LightningModule):
+class LightningLlama(torch.nn.Module):
     def __init__(self, hidden_size: int = 768):
         super().__init__()
         config = LlamaConfig(
@@ -43,7 +46,7 @@ class LightningLlama(L.LightningModule):
         )
         self.model = LlamaForCausalLM(config)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch):
         x, attention_mask, labels = batch
 
         output = self.model(x, attention_mask=attention_mask, labels=labels)
@@ -57,59 +60,35 @@ class LightningLlama(L.LightningModule):
         return optimizer
 
 
-from torch.utils.data import get_worker_info
-from torch.distributed import get_rank, get_world_size
+# %%
+tokenizer = AutoTokenizer.from_pretrained(
+    '/home/<netid>/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08/'
+)
+tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>") # for some reason the hub tokenizer doesn't have the pad token set
 
-tokenized_dataset_path = Path("/home/kobyjl/nobackup/autodelete/rocket-demo/tokenized/")
+# %%
+tokenized_dataset_path = Path("/home/<path-to-tokenized-dataset-folder>/train")
 
-"""
-This class is basically just ripped straight out of rocket. I think there may be ways built
-into Lightning or PyTorch to do this without dealing with the parallelism ourselves, but
-I haven't looked into that yet.
-"""
-class DataSet(torch.utils.data.IterableDataset):
-    def __init__(
-        self, path_to_data, pad_tok, bos_tok, eos_tok, max_sequence_embeddings, cap_length
-    ):
-        assert os.path.isdir(path_to_data), path_to_data
-        self.data = dd.read_parquet(path_to_data / "*.parquet").head(cap_length)
-        # Get length of data
-        self.length = len(self.data)
+class WikitextDataset(Dataset):
+    def __init__(self, batch_size: int) -> None:
+        super().__init__()
+        assert os.path.isdir(tokenized_dataset_path)
+        data = dd.read_parquet(tokenized_dataset_path / '*.parquet').head(128)
+        self.text = data['text']
 
-        self.pad_tok = pad_tok
-        self.bos_tok = bos_tok
-        self.eos_tok = eos_tok
-        self.max_sequence_embeddings = max_sequence_embeddings
+        self.pad_tok = tokenizer.pad_token_id
+        self.bos_tok = tokenizer.bos_token_id
+        self.eos_tok = tokenizer.eos_token_id
+        self.max_sequence_embeddings = 1024
+        self.batch_size = batch_size
 
     def __len__(self):
-        return self.length
+        return len(self.text)
 
-    def __iter__(self):
-        worker_info = get_worker_info()
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-        worker_id = worker_info.id if worker_info is not None else 0
-
-        world_size = get_world_size()
-        process_rank = get_rank()
-
-        # Turn into iterator
-        data = self.data.iterrows()
-
-        for index, item in enumerate(data):
-            if index % (num_workers * world_size) == (process_rank * num_workers + worker_id):
-                item = item[1].values[0].tolist()
-                length = len(item)
-                if length < 2:
-                    continue
-                if length <= self.max_sequence_embeddings:
-                    # item = np.append(item, self.eos_tok)
-                    x = item[: length - 1]
-                    y_true = item[1:length]
-                else:
-                    x = item[: self.max_sequence_embeddings]
-                    y_true = item[1 : self.max_sequence_embeddings + 1]
-                yield (x, y_true)
-
+    def __getitem__(self, index):
+        text = self.text.iloc[index].tolist()
+        return (text, text)
+    
     def generate_mask(self, size, lens):
         masked_tensor = torch.ones((len(lens), size))
         for i, l in enumerate(lens):
@@ -135,66 +114,31 @@ class DataSet(torch.utils.data.IterableDataset):
 
 
 
-tokenizer = AutoTokenizer.from_pretrained(
-    '/home/kobyjl/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08/'
-)
-tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>") # for some reason the hub tokenizer doesn't have the pad token set
-
-
+# %%
 """
-This is also largely just ripped from Rocket. Note that I capped the dataset length at 10k examples.
+A timer callback, based on the built in Lightning one. Feel free to just delete this if you don't want to
+print the total training time.
 """
-class DataModule(L.LightningDataModule):
-    def __init__(self, batch_size):
-        super().__init__()
-        self.pad_id = tokenizer.pad_token_id
-        self.bos_id = tokenizer.bos_token_id
-        self.eos_id = tokenizer.eos_token_id
-        self.max_sequence_embeddings = 1024
-        self.batch_size = batch_size
+class Timer:
+    def __init__(self):
+        self.start_time = None
+        self.elapsed = 0
 
-    def _dataset(self, subpath):
-        return DataSet(
-            tokenized_dataset_path / subpath,
-            pad_tok=self.pad_id,
-            bos_tok=self.bos_id,
-            eos_tok=self.eos_id,
-            max_sequence_embeddings=self.max_sequence_embeddings,
-            cap_length=10000
-        )
+    def on_train_start(self):
+        self.start_time = time.monotonic()
 
-    def setup(self, stage):
-        self.train_dataset = self._dataset("train")
-        self.val_dataset = self._dataset("validation")
-        self.test_dataset = self._dataset("test")
+    def on_train_batch_end(self):
+        if self.start_time is None:
+            raise Exception('start_time must be initialized')
 
-    def _dataloader(self, dataset):
-        return DataLoader(dataset, batch_size=self.batch_size, collate_fn=dataset.pad_to_longest)
+        curr_time = time.monotonic()
+        self.elapsed += curr_time - self.start_time
+        self.start_time = curr_time
 
-    def train_dataloader(self):
-        return self._dataloader(self.train_dataset)
-
-    def val_dataloader(self):
-        return self._dataloader(self.val_dataset)
-
-    def test_dataloader(self):
-        return self._dataloader(self.test_dataset)
+timer = Timer()
 
 
-from lightning.pytorch import Trainer
-from lightning.pytorch.plugins.environments import SLURMEnvironment # pyright: ignore
-
-"""
-The wrapper here was necessary so that we can access the timer after we're done and print out the total time
-elapsed. See LightningCLI below.
-"""
-timer = None
-class TimerWrapper(Timer):
-    def __init__(self) -> None:
-        super().__init__()
-        global timer
-        timer = self
-
+# %%
 def is_notebook():
     try:
         get_ipython() # pyright: ignore
@@ -203,56 +147,152 @@ def is_notebook():
         return False
 
 
-# I'm not totally sure if this is the best setting for auto_wrap_policy. May be more efficient configurations.
-auto_wrap_policy = { Embedding, LlamaDecoderLayer, Linear }
-trainer_defaults = {
-    'max_epochs': 1,
-    'accelerator': 'gpu',
-    """
-    The FSDPStrategy signals that we may be running on multiple gpus/nodes.
+# %%
+from lightning.fabric.strategies.fsdp import FSDPStrategy
 
-    We're supporting two different environments here: from the CLI and in a notebook. From the CLI, LightningCLI
-    will construct the classes involved, so we give it a `lazy_instance`. In a notebook, we can just give it the
-    strategy directly.
-    """
-    'strategy': FSDPStrategy(auto_wrap_policy=auto_wrap_policy)
-                if is_notebook()
-                else lazy_instance(FSDPStrategy, auto_wrap_policy=auto_wrap_policy),
-    """
-    The Timer callback will track how long the training has run for (including across invocations if our training got
-    preempted)
-    """
-    'callbacks': [TimerWrapper()],
-}
+# not sure if this is the ideal auto_wrap_policy
+auto_wrap_policy = { Embedding, LlamaDecoderLayer, Linear }
+strategy = FSDPStrategy(auto_wrap_policy=auto_wrap_policy)
+callbacks: list[object] = [timer]
+
+# %%
+from lightning.fabric.strategies.strategy import Strategy
+from lightning.fabric import Fabric
+from lightning.fabric.plugins.environments.cluster_environment import ClusterEnvironment
+import re
+from subprocess import call
+
+"""
+A pretty basic trainer class. The core is the `fit` method. For distributed training, you need to call `launch`.
+"""
+class Trainer():
+    def __init__(self, default_root_dir: str, callbacks: List[object] = [], devices: int | None=None, num_nodes: int | None=None, strategy: Strategy | str | None=None, environment: ClusterEnvironment | None=None) -> None:
+        devices = devices if devices else 1 
+        num_nodes = num_nodes if num_nodes else 1
+        strategy_dict: dict[Literal['strategy'], Strategy | str] | None = { 'strategy': strategy } if strategy is not None else {}
+        environment_dict: dict[Literal['plugins'], ClusterEnvironment] | None = \
+           { 'plugins': environment } if environment is not None else {}
+        self.fabric = Fabric(devices=devices, num_nodes=num_nodes, callbacks=callbacks, **strategy_dict, **environment_dict)
+
+        self.checkpoint_file = Path(default_root_dir) / 'checkpoint.ckpt'
+
+        self.module: LightningLlama | None = None
+        self.optimizer: optim.Optimizer | None = None
+
+        self.iteration = 0
+
+        self.requeue_signal = getattr(environment, 'requeue_signal', None) \
+            if getattr(environment, 'auto_requeue', False) else None
+
+    def fit(self, module: LightningLlama, dataset: WikitextDataset):
+        module, optimizer = self.fabric.setup(module, module.configure_optimizers())
+        self.module = module
+        self.optimizer = optimizer
+        
+        if os.path.isdir(self.checkpoint_file):
+            print('loading checkpoint')
+            state = self._get_state()
+            self.fabric.load(self.checkpoint_file, state)
+            timer.elapsed = state.get('elapsed', 0)
+            self.iteration = state.get('iteration', 0)
+            print(f'loaded {timer.elapsed} {self.iteration} {state}')
+            sys.stdout.flush()
+       
+        dataloader = DataLoader(dataset, batch_size=dataset.batch_size, collate_fn=dataset.pad_to_longest)
+        dataloader = self.fabric.setup_dataloaders(dataloader)
+        
+        self.fabric.call('on_train_start')
+        # train for a single epoch
+        for i, batch in enumerate(dataloader):
+            # skip to saved iteration
+            if i < self.iteration:
+                print(f'skipping {i}')
+                continue
+            optimizer.zero_grad()
+            loss = module.training_step(batch)
+            self.fabric.backward(loss)
+            optimizer.step()
+
+            self.iteration = i
+
+            self.fabric.call('on_train_batch_end')
+        
+        if self.fabric.is_global_zero:
+           print(f'Training time (sec): {timer.elapsed}')
+
+    def _get_state(self):
+        return { 'module': self.module, 'optimizer': self.optimizer, 'iteration': self.iteration, 'elapsed': timer.elapsed }
+
+    def launch(self, module: LightningLlama, dataset: WikitextDataset):
+        def _launch(_):
+            print(self.requeue_signal)
+            if self.requeue_signal:
+                print('Setting up requeue handler')
+                sys.stdout.flush()
+                signal.signal(self.requeue_signal, self._requeue_handler)
+
+            return self.fit(module, dataset)
+        return self.fabric.launch(_launch)
+
+    def _requeue_handler(self, _signum: int, _stack: FrameType | None):
+        self.fabric.save(self.checkpoint_file, self._get_state())
+        
+        if self.fabric.is_global_zero:
+            # find job id
+            array_job_id = os.getenv("SLURM_ARRAY_JOB_ID")
+            if array_job_id is not None:
+                array_task_id = os.environ["SLURM_ARRAY_TASK_ID"]
+                job_id = f"{array_job_id}_{array_task_id}"
+            else:
+                job_id = os.environ["SLURM_JOB_ID"]
+
+            assert re.match("[0-9_-]+", job_id)
+            cmd = ["scontrol", "requeue", job_id]
+
+            # requeue job
+            print(f"requeing job {job_id}...")
+            try:
+                result = call(cmd)
+            except FileNotFoundError:
+                # This can occur if a subprocess call to `scontrol` is run outside a shell context
+                # Re-attempt call (now with shell context). If any error is raised, propagate to user.
+                # When running a shell command, it should be passed as a single string.
+                result = call(" ".join(cmd), shell=True)
+
+            # print result text
+            if result == 0:
+                print(f"Requeued SLURM job: {job_id}")
+            else:
+                print(f"Requeuing SLURM job {job_id} failed with error code {result}")
+            print(f'saved {self.iteration} {timer.elapsed}')
+            sys.stdout.flush()
 
 
 # %%
+from jsonargparse import Namespace
+
 if is_notebook():
-    module = LightningLlama(hidden_size=8192)
-    dm = DataModule(batch_size=1)
-    dm.setup('')
+    module = LightningLlama(hidden_size=32)
+    dataset = WikitextDataset(batch_size=1)
 
-    trainer = Trainer(**trainer_defaults)
-    trainer.fit(module, dm)
+    trainer = Trainer(callbacks=callbacks, strategy='ddp_notebook', default_root_dir='experiments/notebook')
+    trainer.launch(module, dataset)
 else:
-    trainer_defaults = {
-        **trainer_defaults,
-        """
-        The SLURMEnvironment plugin sets up requeueing after timeouts. In other words, if your training runs out of time, this line means
-        it will automatically requeue (if your sbatch file includes the proper settings for requeueing, which launch_experiment.sh does).
-        We are using `class_path` and `init_args` here because we want LightningCLI to construct it.
-        """
-        'plugins': { 'class_path': 'lightning.pytorch.plugins.environments.SLURMEnvironment', 'init_args': { 'requeue_signal': signal.SIGHUP }}
-
+    trainer_overrides = {
+        'callbacks': callbacks,
+        'strategy': strategy,
+        'environment': SLURMEnvironment(requeue_signal=signal.SIGHUP)
     }
-    """
-    LightningCLI is a very cool class. It will automatically initialize our module and data module for us (given CLI arguments for the constructor args).
-    It can also do all kinds of other stuff like choosing which module to use if we have multiple. However, if you want something simpler, you can
-    construct the trainer manually, similarly to how it is done in the `is_notebook()` branch.
+    def cli_main(trainer: Trainer, model: LightningLlama, data: WikitextDataset):
+        trainer.launch(model, data)
 
-    `save_config_kwargs` is necessary if your process gets requeued.
-    """
-    LightningCLI(LightningLlama, DataModule, trainer_defaults=trainer_defaults, save_config_kwargs={ 'overwrite': True })
-if not timer:
-    raise Exception('timer not set')
-print(f'Training time (sec): {timer.time_elapsed('train')}')
+    parser = auto_parser(cli_main)
+    cfg = parser.parse_args()
+    cfg.update(Namespace(trainer_overrides), 'trainer.init_args', only_unset=False)
+    if hasattr(cfg, 'config'):
+       del cfg.config # pyright: ignore
+    init = parser.instantiate_classes(cfg)
+
+    cli_main(**init)
+# %% [markdown]
+#
